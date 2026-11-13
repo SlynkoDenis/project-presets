@@ -1,0 +1,7 @@
+[extend]
+useDefault = true
+
+[[rules]]
+id = "provider-token"
+description = "Provider token"
+regex = '''\bsk-[A-Za-z0-9_-]{20,}'''

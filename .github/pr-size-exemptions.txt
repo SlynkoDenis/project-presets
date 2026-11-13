@@ -1,0 +1,5 @@
+# Commit SHAs allowed to exceed the added-line size budget.
+# One entry per line: <full-40-character-commit-sha> <reason>
+# An entry applies when its commit is in the merge-base..head range under review.
+
+3e3ece4275ba1d26413e4ba91a0826d6d4c1a6c1 Initialize project infrastructure

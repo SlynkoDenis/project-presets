@@ -1,0 +1,70 @@
+name: Slopo duplication review
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    # Runs on every same-repository pull request; add path filters when the layout is fixed.
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: slopo-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+jobs:
+  slopo-review:
+    name: slopo-review
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
+    # Advisory: a failing step must never fail the pull request's checks.
+    continue-on-error: true
+    runs-on: arc-runner-set
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      pull-requests: write # The publish step posts or updates one sticky review comment.
+    steps:
+      - name: Check out the reviewed revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Run slopo analysis
+        uses: ./.github/actions/slopo-analysis
+      - name: Publish review comment
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 .github/scripts/slopo_comment.py
+      - name: Preserve report and run evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: slopo-review-${{ github.run_attempt }}
+          path: |
+            .dealer-local/slopo/run.log
+            .dealer-local/slopo/report
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+  slopo-warm:
+    name: slopo-warm
+    if: github.event_name != 'pull_request'
+    # Advisory: cache warming must never fail the main-branch run.
+    continue-on-error: true
+    runs-on: arc-runner-set
+    timeout-minutes: 180
+    steps:
+      - name: Check out the default revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run slopo analysis
+        uses: ./.github/actions/slopo-analysis
+        with:
+          save-caches: 'true'

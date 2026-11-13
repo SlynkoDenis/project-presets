@@ -1,0 +1,316 @@
+name: Nightly dead-code audit
+on:
+  schedule:
+    - cron: '0 21 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Audit without pushing or opening a pull request
+        type: boolean
+        default: false
+permissions:
+  contents: read # Default for every job; jobs add only the scopes they need.
+concurrency:
+  group: dead-code-nightly
+  cancel-in-progress: false
+jobs:
+  preflight:
+    name: Preflight
+    runs-on: arc-runner-set
+    timeout-minutes: 10
+    permissions:
+      contents: read # Read the audited source tree.
+      actions: read # Read previous workflow runs for the audit baseline.
+      issues: read # Search merged pull requests.
+      pull-requests: read # Read merged and open pull requests.
+    outputs:
+      run: ${{ steps.baseline.outputs.run }}
+      base: ${{ steps.baseline.outputs.base }}
+      head: ${{ steps.baseline.outputs.head }}
+      branch: ${{ steps.baseline.outputs.branch }}
+    steps:
+      - name: Check out the launch revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve the audit range
+        id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p .dealer-local/dead-code-nightly
+          python3 .github/scripts/dead_code_nightly.py baseline \
+            --output .dealer-local/dead-code-nightly \
+            --github-output "$GITHUB_OUTPUT" \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - name: Preserve preflight evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dead-code-preflight
+          path: .dealer-local/dead-code-nightly/
+          include-hidden-files: true
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+  audit:
+    name: Audit
+    needs: [preflight]
+    if: needs.preflight.outputs.run == 'true'
+    runs-on: arc-runner-set
+    timeout-minutes: 140
+    permissions:
+      contents: read # Read the audited source tree without a write token.
+    outputs:
+      audited: ${{ steps.collect.outputs.audited }}
+      changed: ${{ steps.collect.outputs.changed }}
+    steps:
+      - name: Check out the audited revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.head }}
+          fetch-depth: 0
+          persist-credentials: false
+      # Add project toolchain and dependency setup here.
+      - name: Download preflight evidence
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dead-code-preflight
+          path: .dealer-local/dead-code-nightly/
+      - name: Prepare trusted audit inputs
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/dead-code-trusted"
+          cp .gitleaks.toml "$RUNNER_TEMP/gitleaks.toml"
+          cp .github/dead-code-nightly/prompt.md "$RUNNER_TEMP/dead-code-trusted/"
+      - name: Install the pinned omp harness
+        run: |
+          set -euo pipefail
+          version=18.12.6
+          digest=85d9daf3a05fc76e8cd425ae1904eb576af8d21cc85fcf4690742626e07ccfa4
+          mkdir -p "$RUNNER_TEMP/omp"
+          curl --fail --location --silent --show-error \
+            "https://github.com/can1357/oh-my-pi/releases/download/v${version}/omp-linux-x64" \
+            --output "$RUNNER_TEMP/omp/omp"
+          echo "${digest}  $RUNNER_TEMP/omp/omp" | sha256sum --check --strict
+          chmod +x "$RUNNER_TEMP/omp/omp"
+          "$RUNNER_TEMP/omp/omp" --version
+          echo "$RUNNER_TEMP/omp" >> "$GITHUB_PATH"
+      - name: Prepare audit skills
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          make setup-skills
+          ponytail_ref=96608e078b2d5ea607c5c3b8b5a54d1c1fba6846
+          for skill in ponytail ponytail-review; do
+            gh skills install DietrichGebert/ponytail "skills/$skill" \
+              --pin "$ponytail_ref" --dir "$GITHUB_WORKSPACE/.agents/skills" --force
+          done
+      - name: Run the DeepSeek dead-code audit
+        timeout-minutes: 100
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEAD_CODE_BASE_SHA: ${{ needs.preflight.outputs.base }}
+          DEAD_CODE_HEAD_SHA: ${{ needs.preflight.outputs.head }}
+          NO_COLOR: '1'
+        run: |
+          set -euo pipefail
+          if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
+            echo "::error::DEEPSEEK_API_KEY is not configured."
+            exit 1
+          fi
+          mkdir -p .dealer-local/dead-code-nightly "$RUNNER_TEMP/dead-code-sessions"
+          env -u ACTIONS_RUNTIME_TOKEN -u ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+            -u ACTIONS_ID_TOKEN_REQUEST_URL -u GITHUB_ENV -u GITHUB_OUTPUT \
+            -u GITHUB_PATH -u GITHUB_STEP_SUMMARY \
+            omp --print --model deepseek/deepseek-flash --thinking max --auto-approve \
+            --session-dir "$RUNNER_TEMP/dead-code-sessions" --no-pty --no-extensions --no-title \
+            --max-time 5400 \
+            --config .github/dead-code-nightly/omp.yml \
+            @"$RUNNER_TEMP/dead-code-trusted/prompt.md" \
+            @.dealer-local/dead-code-nightly/scope.md 2>&1 | tee .dealer-local/dead-code-nightly/omp.log
+      - name: Collect the proposed patch
+        id: collect
+        env:
+          EXPECTED_HEAD: ${{ needs.preflight.outputs.head }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/dead-code-audit"
+          mkdir -p "$stage"
+          if [ "$(git rev-parse HEAD)" != "$EXPECTED_HEAD" ]; then
+            echo "::error::The audit tree was committed; refusing to collect a patch."
+            exit 1
+          fi
+          git add -A -N
+          git diff --binary HEAD > "$stage/changes.patch"
+          git status --porcelain > "$stage/status.txt"
+          if [ -f .dealer-local/dead-code-nightly/report.md ]; then
+            cp .dealer-local/dead-code-nightly/report.md "$stage/"
+          fi
+          if [ -s "$stage/changes.patch" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "audited=true" >> "$GITHUB_OUTPUT"
+      - name: Install pinned gitleaks
+        id: setup-gitleaks
+        if: always()
+        uses: ./.github/actions/setup-gitleaks
+      - name: Preserve publishable audit evidence
+        if: always()
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/dead-code-audit"
+          mkdir -p "$stage"
+          for file in scope.md preflight.json report.md omp.log; do
+            if [ -f ".dealer-local/dead-code-nightly/$file" ]; then
+              cp ".dealer-local/dead-code-nightly/$file" "$stage/$file"
+            fi
+          done
+          if [ -n "${DEEPSEEK_API_KEY:-}" ] && grep -RFq -- "$DEEPSEEK_API_KEY" "$stage"; then
+            find "$stage" -type f -delete
+            echo "Credential material was detected and removed from the audit evidence." > "$stage/SECURITY.txt"
+            echo "::error::Credential material was detected in the audit output."
+            exit 1
+          fi
+      - name: Scan audit evidence for secrets
+        if: always()
+        env:
+          GITLEAKS: ${{ steps.setup-gitleaks.outputs.gitleaks }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/dead-code-audit"
+          if [ -z "$GITLEAKS" ] || ! "$GITLEAKS" dir "$stage" --redact --verbose --config "$RUNNER_TEMP/gitleaks.toml"; then
+            rm -rf "$stage"
+            mkdir -p "$stage"
+            echo 'Evidence unavailable: secret scan failed.' > "$stage/SECURITY.txt"
+            exit 1
+          fi
+      - name: Scan agent transcript for secrets
+        if: always()
+        env:
+          GITLEAKS: ${{ steps.setup-gitleaks.outputs.gitleaks }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/dead-code-audit"
+          transcript="$RUNNER_TEMP/dead-code-sessions"
+          if [ ! -d "$transcript" ]; then
+            exit 0
+          fi
+          if [ -z "$GITLEAKS" ]; then
+            rm -rf "$transcript"
+            echo 'Agent transcript omitted: secret scan unavailable.' > "$stage/SECURITY.txt"
+            echo "::warning::The agent transcript was omitted because the secret scan was unavailable."
+            exit 0
+          fi
+          failed=false
+          if [ -n "${DEEPSEEK_API_KEY:-}" ] && grep -RFq -- "$DEEPSEEK_API_KEY" "$transcript"; then
+            failed=true
+          fi
+          if ! "$GITLEAKS" dir "$transcript" --redact --verbose --config "$RUNNER_TEMP/gitleaks.toml"; then
+            failed=true
+          fi
+          if [ "$failed" = true ]; then
+            rm -rf "$transcript"
+            echo 'Agent transcript omitted: secret-like content was detected.' > "$stage/SECURITY.txt"
+            echo "::warning::The agent transcript contained secret-like content and was omitted from the audit evidence."
+          else
+            cp -R "$transcript" "$stage/dead-code-sessions"
+          fi
+      - name: Upload audit evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dead-code-audit
+          path: ${{ runner.temp }}/dead-code-audit/
+          include-hidden-files: true
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30
+  publish:
+    name: Publish draft pull request
+    needs: [preflight, audit]
+    if: >-
+      needs.audit.outputs.audited == 'true' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'schedule' || inputs.dry_run != true)
+    runs-on: arc-runner-set
+    timeout-minutes: 15
+    permissions:
+      contents: write # Push the generated removal branch.
+      pull-requests: write # Open the draft cleanup pull request.
+    steps:
+      - name: Check out the audited revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.head }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Preserve the trusted verifier
+        run: |
+          cp .github/scripts/dead_code_nightly.py "$RUNNER_TEMP/dead-code-nightly.py"
+      - name: Download audit evidence
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dead-code-audit
+          path: ${{ runner.temp }}/dead-code-audit
+      - name: Download preflight evidence
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dead-code-preflight
+          path: ${{ runner.temp }}/dead-code-preflight
+      - name: Apply the proposed patch
+        env:
+          EXPECTED_CHANGED: ${{ needs.audit.outputs.changed }}
+        run: |
+          set -euo pipefail
+          patch="$RUNNER_TEMP/dead-code-audit/changes.patch"
+          if [ "$EXPECTED_CHANGED" = 'true' ] && [ ! -s "$patch" ]; then
+            echo "::error::The audit reported changes but the patch is missing."
+            exit 1
+          fi
+          if [ -s "$patch" ]; then
+            git apply --binary "$patch"
+          fi
+      - name: Verify the proposed patch
+        env:
+          AUDITED_HEAD: ${{ needs.preflight.outputs.head }}
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/dead-code-nightly.py" verify \
+            --head "$AUDITED_HEAD" \
+            --report "$RUNNER_TEMP/dead-code-audit/report.md" \
+            --output "$RUNNER_TEMP/dead-code-audit/validation.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - name: Publish the draft pull request
+        env:
+          GH_TOKEN: ${{ secrets.DEALER_REPOSITORY_TOKEN || github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/dead-code-nightly.py" publish \
+            --preflight "$RUNNER_TEMP/dead-code-preflight/preflight.json" \
+            --validation "$RUNNER_TEMP/dead-code-audit/validation.json" \
+            --report "$RUNNER_TEMP/dead-code-audit/report.md" \
+            --body "$RUNNER_TEMP/dead-code-audit/pr-body.md" \
+            --output "$RUNNER_TEMP/dead-code-audit/publish.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+      - name: Preserve publish evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dead-code-publish
+          path: ${{ runner.temp }}/dead-code-audit/
+          include-hidden-files: true
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 30

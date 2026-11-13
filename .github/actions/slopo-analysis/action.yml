@@ -1,0 +1,98 @@
+name: Slopo analysis
+description: Run the advisory slopo duplication analysis with a local Ollama embedding model
+inputs:
+  slopo-version:
+    description: Exact slopo version executed through uv
+    default: '0.9.0'
+  ollama-image:
+    description: Digest-pinned Ollama container image
+    default: 'docker.io/ollama/ollama@sha256:8262851b2846b87c649eddf3e76beb270c52f4d1bc94559f47efde16b0841551'
+  ollama-model:
+    description: Ollama embedding model name
+    default: 'unclemusclez/jina-embeddings-v2-base-code'
+  save-caches:
+    description: Save the embedding model and slopo database caches after a successful analysis
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Restore cached embedding model
+      id: model-cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .ollama/models
+        key: ollama-jina-embeddings-v2-base-code-1
+    - name: Start Ollama and pull the embedding model
+      shell: bash
+      env:
+        TMPDIR: ${{ runner.temp }}
+        OLLAMA_IMAGE: ${{ inputs.ollama-image }}
+        OLLAMA_MODEL: ${{ inputs.ollama-model }}
+      run: |
+        mkdir -p .ollama/models
+        docker run -d --name ollama -p 11434:11434 -v "$PWD/.ollama:/root/.ollama" "$OLLAMA_IMAGE"
+        for _ in $(seq 1 30); do
+          if curl -sf http://localhost:11434/api/tags > /dev/null; then break; fi
+          sleep 1
+        done
+        curl -sf http://localhost:11434/api/tags > /dev/null
+        docker exec ollama ollama pull "$OLLAMA_MODEL"
+        docker exec ollama chown -R "$(id -u):$(id -g)" /root/.ollama
+    - name: Install uv
+      uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+      with:
+        version: '0.13.0'
+        enable-cache: true
+        cache-dependency-glob: slopo.conf.yaml
+        cache-suffix: slopo-${{ inputs.slopo-version }}
+    - name: Restore cached slopo database
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .dealer-local/slopo/slopo.db
+        key: slopo-db-${{ runner.os }}-${{ inputs.slopo-version }}-${{ hashFiles('slopo.conf.yaml') }}-${{ github.sha }}
+        restore-keys: slopo-db-${{ runner.os }}-${{ inputs.slopo-version }}-${{ hashFiles('slopo.conf.yaml') }}-
+    - name: Run slopo analysis
+      id: analysis
+      shell: bash
+      env:
+        SLOPO_VERSION: ${{ inputs.slopo-version }}
+        EVENT_NAME: ${{ github.event_name }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      run: |
+        set -euo pipefail
+        source_dir="$(sed -n 's/^source_dir:[[:space:]]*//p' slopo.conf.yaml)"
+        SOURCE_DIR="$source_dir" python3 .github/scripts/check_slopo_db.py
+        mkdir -p .dealer-local/slopo
+        log=.dealer-local/slopo/run.log
+        {
+          uvx --from "slopo==$SLOPO_VERSION" slopo show-config
+          uvx --from "slopo==$SLOPO_VERSION" slopo index
+          uvx --from "slopo==$SLOPO_VERSION" slopo embed
+          if [ "$EVENT_NAME" = pull_request ]; then
+            base="$(git merge-base "$BASE_SHA" HEAD)"
+            uvx --from "slopo==$SLOPO_VERSION" slopo review --base "$base"
+          fi
+        } 2>&1 | tee "$log"
+    - name: Save slopo database cache
+      if: inputs.save-caches == 'true' && steps.analysis.outcome == 'success'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .dealer-local/slopo/slopo.db
+        key: slopo-db-${{ runner.os }}-${{ inputs.slopo-version }}-${{ hashFiles('slopo.conf.yaml') }}-${{ github.sha }}
+    - name: Save embedding model cache
+      if: inputs.save-caches == 'true' && steps.analysis.outcome == 'success' && steps.model-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: .ollama/models
+        key: ollama-jina-embeddings-v2-base-code-1
+    - name: Note analysis failure
+      if: ${{ !cancelled() && steps.analysis.outcome != 'success' }}
+      shell: bash
+      run: |
+        {
+          echo "## Slopo duplication review"
+          echo ""
+          echo "The advisory analysis could not complete for this revision."
+          echo "See the failed step logs in this workflow run."
+          echo "This does not block merges."
+        } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,80 @@
+name: Pre-merge
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+defaults:
+  run:
+    shell: bash
+jobs:
+  pr-size-budget:
+    name: PR size budget
+    runs-on: arc-runner-set
+    timeout-minutes: 5
+    steps:
+      - name: Check out the reviewed revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check added-lines budget
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: >-
+          python3 .github/scripts/check_added_lines_budget.py
+          --base "origin/${BASE_REF}"
+          --limit 1000
+          --exemptions .github/pr-size-exemptions.txt
+  pre-commit:
+    name: pre-commit
+    runs-on: arc-runner-set
+    timeout-minutes: 15
+    steps:
+      - name: Check out the reviewed revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        with:
+          version: '0.13.0'
+          enable-cache: true
+      - name: Install pre-commit
+        run: |
+          set -euo pipefail
+          uv tool install --force pre-commit==4.6.0
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Run pre-commit on changed files
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          pre-commit run --from-ref "origin/${BASE_REF}" --to-ref HEAD --show-diff-on-failure
+  build:
+    name: build
+    if: always()
+    needs: [pr-size-budget, pre-commit]
+    runs-on: arc-runner-set
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require mandatory checks
+        env:
+          SIZE_RESULT: ${{ needs.pr-size-budget.result }}
+          PRECOMMIT_RESULT: ${{ needs.pre-commit.result }}
+        run: |
+          set -euo pipefail
+          [ "$SIZE_RESULT" = 'success' ] || {
+            echo '::error::The PR size budget did not succeed.'
+            exit 1
+          }
+          [ "$PRECOMMIT_RESULT" = 'success' ] || {
+            echo '::error::Pre-commit did not succeed.'
+            exit 1
+          }

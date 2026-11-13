@@ -1,0 +1,8 @@
+# Narrow this to the project's source directory once the layout is fixed.
+source_dir: .
+db_file: .dealer-local/slopo/slopo.db
+report_dir: .dealer-local/slopo/report
+ignore_file: .dealer-local/slopo/slopo.ignore.txt
+agent_log_file: .dealer-local/slopo/slopo.agent.log
+embedding_model: ollama/unclemusclez/jina-embeddings-v2-base-code
+embedding_dimensions: 768

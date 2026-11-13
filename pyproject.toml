@@ -1,0 +1,39 @@
+# Development-only checks for Python scripts
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = [".github/scripts"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "ANN401",
+    "C901",
+    "COM812",
+    "CPY001",
+    "D101",
+    "D103",
+    "D203",
+    "D213",
+    "EM101",
+    "EM102",
+    "INP001",
+    "ISC001",
+    "PLR0912",
+    "PLR0915",
+    "RUF001",
+    "S310",
+    "S603",
+    "S607",
+    "T201",
+    "TRY003",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true

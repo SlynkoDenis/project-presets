@@ -1,0 +1,47 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-shebang-scripts-are-executable
+      - id: check-toml
+      - id: check-yaml
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-added-large-files
+        args: [--maxkb=100]
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+        name: GitHub Actions workflow linter
+        args: ["-ignore", 'label "(ubuntu-slim|arc-runner-set)" is unknown']
+        files: ^\.github/workflows/.*\.ya?ml$
+  - repo: https://github.com/woodruffw/zizmor-pre-commit
+    rev: v1.13.0
+    hooks:
+      - id: zizmor
+        name: GitHub Actions security auditor
+        args: ["--persona=pedantic"]
+        files: ^\.github/(workflows/.*\.ya?ml|actions/.*/action\.ya?ml)$
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+  - repo: local
+    hooks:
+      - id: python-scripts
+        name: Python workflow scripts (mypy, ruff)
+        entry: >-
+          bash -c 'uvx --from mypy==2.4.1 mypy .github/scripts/*.py &&
+          uvx --from ruff==0.17.5 ruff check .github/scripts &&
+          uvx --from ruff==0.17.5 ruff format --check .github/scripts'
+        language: system
+        pass_filenames: false
+        always_run: true
